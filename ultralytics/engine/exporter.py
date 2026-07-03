@@ -198,6 +198,17 @@ def export_formats():
             ["batch", "name", "quantize", "data", "fraction"],
             "isolated-rknn",
         ],
+        [
+            # Raw per-stride ONNX for external RKNN INT8 conversion (DFL decode + NMS run on CPU on-device).
+            # Unlike 'rknn', this emits undecoded outputs (no on-graph decode/TopK) and needs only onnx/onnxslim.
+            "ONNX for RKNN",
+            "onnx_for_rknn",
+            "_rknn.onnx",
+            True,
+            True,
+            ["batch", "opset", "simplify"],
+            "base",
+        ],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
         [
             "Axelera AI",
@@ -905,7 +916,18 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        if self.args.format == "onnx_for_rknn":
+            # Name the raw per-stride outputs semantically so on-device post-processing can map them by name.
+            strides = self.model.stride.int().tolist()
+            output_names = []
+            for s in strides:
+                output_names += [f"bbox_s{s}", f"cls_s{s}"]
+            if self.model.task == "pose":
+                output_names += [f"kpt_s{s}" for s in strides]
+        elif self.model.task == "segment":
+            output_names = ["output0", "output1"]
+        else:
+            output_names = ["output0"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
@@ -1341,6 +1363,26 @@ class Exporter:
             metadata=self.metadata,
             prefix=prefix,
         )
+
+    @try_export
+    def export_onnx_for_rknn(self, prefix=colorstr("ONNX for RKNN:")):
+        """Export a raw per-stride ONNX graph for external Rockchip RKNN (INT8) conversion.
+
+        Unlike ``format='rknn'`` (which decodes boxes on-graph and can run the rknn-toolkit2 INT8 conversion here),
+        this emits undecoded per-stride bbox/cls(/kpt) tensors so DFL decode and NMS run on the CPU after conversion -
+        the quantization-friendly layout used by rknn_model_zoo. It needs only onnx/onnxslim (no rknn-toolkit2); convert
+        the resulting ONNX to ``.rknn`` on your target board.
+        """
+        assert self.model.task in {"detect", "pose"}, (
+            f"format='onnx_for_rknn' supports detect and pose tasks only, but got task='{self.model.task}'. "
+            "Use format='rknn' for other tasks."
+        )
+        self.args.opset = min(self.args.opset or 19, 19)  # rknn-toolkit expects opset<=19
+        self.args.simplify = True  # force onnxslim for a clean, RKNN-friendly graph
+        f_onnx = Path(self.export_onnx())
+        f = f_onnx.with_name(f"{f_onnx.stem}_rknn.onnx")  # distinguish from a plain ONNX export
+        f_onnx.replace(f)
+        return str(f)
 
     @try_export
     def export_imx(self, prefix=colorstr("IMX:")):
