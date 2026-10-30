@@ -27,6 +27,7 @@ from ultralytics.nn.modules import (
     SPPF,
     A2C2f,
     AConv,
+    Add,
     ADown,
     Bottleneck,
     BottleneckCSP,
@@ -43,6 +44,8 @@ from ultralytics.nn.modules import (
     Concat,
     Conv,
     Conv2,
+    Conv4LayerBlock,
+    ConvDPUnit,
     ConvTranspose,
     Detect,
     DWConv,
@@ -72,6 +75,8 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
+    YuNetPoseHead,
+    YuNetStem,
     v10Detect,
 )
 from ultralytics.utils import (
@@ -1918,6 +1923,13 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m in frozenset({ConvDPUnit, Conv4LayerBlock, YuNetStem}):
+            # YuNet modules use exact channels from YAML (no width scaling)
+            c1 = ch[f]
+            c2 = args[1] if m is YuNetStem else args[0]
+            args = [c1, *args]
+        elif m is Add:
+            c2 = ch[f[0]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
@@ -1931,6 +1943,7 @@ def parse_model(d, ch, verbose=True):
                 YOLOESegment26,
                 Pose,
                 Pose26,
+                YuNetPoseHead,
                 OBB,
                 OBB26,
             }
@@ -1938,7 +1951,19 @@ def parse_model(d, ch, verbose=True):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            if m in {
+                Detect,
+                YOLOEDetect,
+                Segment,
+                Segment26,
+                YOLOESegment,
+                YOLOESegment26,
+                Pose,
+                Pose26,
+                YuNetPoseHead,
+                OBB,
+                OBB26,
+            }:
                 m.legacy = legacy
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
