@@ -923,7 +923,10 @@ class Exporter:
             for s in strides:
                 output_names += [f"bbox_s{s}", f"cls_s{s}"]
             if self.model.task == "pose":
-                output_names += [f"kpt_s{s}" for s in strides]
+                # Coordinates and visibility ship separately so INT8 conversion gives each tensor its own scale.
+                ndim = self.model.model[-1].kpt_shape[1]
+                for s in strides:
+                    output_names += [f"kpt_xy_s{s}"] + ([f"kpt_vis_s{s}"] if ndim == 3 else [])
         elif self.model.task == "segment":
             output_names = ["output0", "output1"]
         else:
