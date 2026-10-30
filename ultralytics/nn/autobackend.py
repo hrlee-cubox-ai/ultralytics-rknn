@@ -419,7 +419,9 @@ class AutoBackend(nn.Module):
         format = max(matches)[2] if matches else None
         if format == "-":
             format = "pt"
-        elif format == "onnx" and dnn:
+        elif format == "onnx_for_rknn":  # raw per-stride RKNN ONNX is still a plain ONNX graph
+            format = "onnx"
+        if format == "onnx" and dnn:
             format = "dnn"
         elif format is None:
             from urllib.parse import urlsplit
