@@ -579,6 +579,46 @@ class OBB26(OBB):
         return preds
 
 
+def _sliced_conv(conv: nn.Conv2d, idx: list[int], x: torch.Tensor) -> torch.Tensor:
+    """Run ``conv`` keeping only output channels ``idx``, slicing the weights rather than the result.
+
+    Slicing the weights is what makes a channel split survive INT8 conversion: slicing the output tensor
+    would leave both halves on the parent tensor's quantization scale, while a narrower conv gets its own.
+    """
+    w, b = conv.weight[idx], None if conv.bias is None else conv.bias[idx]
+    groups = len(idx) if conv.groups == conv.out_channels > 1 else conv.groups  # depthwise stays depthwise
+    return F.conv2d(x, w, b, conv.stride, conv.padding, conv.dilation, groups)
+
+
+def _kpt_proj(proj: nn.Module, x: torch.Tensor, idx: list[int]) -> torch.Tensor:
+    """Apply a keypoint projection, emitting only its output channels ``idx``."""
+    if isinstance(proj, nn.Conv2d):  # Pose26
+        return _sliced_conv(proj, idx, x)
+    # ConvDPUnit (YuNet heads): 1x1 pointwise + 3x3 depthwise, built with bn_relu=False on the kpt branch
+    assert not proj.withBNRelu, "keypoint projection with BN/ReLU cannot be channel-sliced"
+    return _sliced_conv(proj.conv2, idx, _sliced_conv(proj.conv1, idx, x))
+
+
+def _kpt_xy_vis(proj: nn.Module, x: torch.Tensor, kpt_shape: tuple) -> list[torch.Tensor]:
+    """Project keypoints as separate coordinate and visibility tensors for raw RKNN export.
+
+    The projection emits interleaved (x, y, visibility) per keypoint. Left as one tensor, the raw
+    coordinates and the visibility logits share an INT8 scale set by whichever is wider - measured on
+    yunet26t that costs the visibility all but ~14 of its 255 levels and widens the coordinate step by
+    ~1.8x. Emitting them separately gives each its own scale and drops the reshape/concat block that
+    RKNN batch expansion also trips over.
+    """
+    if isinstance(proj, nn.Sequential):  # Pose: feature convs, then the 1x1 projection
+        for m in proj[:-1]:
+            x = m(x)
+        proj = proj[-1]
+    nkpt, ndim = kpt_shape
+    xy = _kpt_proj(proj, x, [k * ndim + d for k in range(nkpt) for d in range(2)])
+    if ndim == 2:
+        return [xy]
+    return [xy, _kpt_proj(proj, x, [k * ndim + 2 for k in range(nkpt)]).sigmoid()]
+
+
 class Pose(Detect):
     """YOLO Pose head for keypoints models.
 
@@ -638,18 +678,12 @@ class Pose(Detect):
 
     def forward(self, x: list[torch.Tensor]):
         """Perform forward pass through the YOLO Pose head and return predictions."""
-        # RKNN raw export: emit per-stride keypoint tensors (raw x,y + sigmoid visibility) alongside detect outputs.
+        # RKNN raw export: emit per-stride keypoint coordinates and sigmoid visibility as separate tensors.
         if self.export and self.format == "onnx_for_rknn":
             pose_head = self.cv4 if self.cv4 is not None else self.one2one_cv4  # None after fuse() on end2end models
             kpts = []
             for i in range(self.nl):
-                kpt = pose_head[i](x[i])
-                bs, c, h, w = kpt.shape
-                ndim = self.kpt_shape[1]
-                kpt = kpt.reshape(bs, self.kpt_shape[0], ndim, h, w)
-                if ndim == 3:
-                    kpt = torch.cat([kpt[:, :, :2], kpt[:, :, 2:3].sigmoid()], dim=2)  # sigmoid visibility only
-                kpts.append(kpt.reshape(bs, c, h, w))
+                kpts += _kpt_xy_vis(pose_head[i], x[i], self.kpt_shape)
             return Detect.forward(self, x), kpts
 
         return super().forward(x)
@@ -765,19 +799,13 @@ class Pose26(Pose):
 
     def forward(self, x: list[torch.Tensor]):
         """Perform forward pass through the YOLO26 Pose head and return predictions."""
-        # RKNN raw export: emit per-stride keypoint tensors (raw x,y + sigmoid visibility) alongside detect outputs.
+        # RKNN raw export: emit per-stride keypoint coordinates and sigmoid visibility as separate tensors.
         if self.export and self.format == "onnx_for_rknn":
             pose_head = self.cv4 if self.cv4 is not None else self.one2one_cv4  # None after fuse() on end2end models
             kpts_head = self.cv4_kpts if self.cv4_kpts is not None else self.one2one_cv4_kpts
             kpts = []
             for i in range(self.nl):
-                kpt = kpts_head[i](pose_head[i](x[i]))  # cv4 extracts features, cv4_kpts projects to keypoints
-                bs, c, h, w = kpt.shape
-                ndim = self.kpt_shape[1]
-                kpt = kpt.reshape(bs, self.kpt_shape[0], ndim, h, w)
-                if ndim == 3:
-                    kpt = torch.cat([kpt[:, :, :2], kpt[:, :, 2:3].sigmoid()], dim=2)  # sigmoid visibility only
-                kpts.append(kpt.reshape(bs, c, h, w))
+                kpts += _kpt_xy_vis(kpts_head[i], pose_head[i](x[i]), self.kpt_shape)  # cv4 features, cv4_kpts projects
             return Detect.forward(self, x), kpts
 
         return super().forward(x)
