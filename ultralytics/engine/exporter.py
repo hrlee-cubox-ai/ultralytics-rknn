@@ -1667,7 +1667,8 @@ class Exporter:
             "Use format='rknn' for other tasks."
         )
         self.args.opset = min(self.args.opset or 19, 19)  # rknn-toolkit expects opset<=19
-        self.args.simplify = True  # force onnxslim for a clean, RKNN-friendly graph
+        # simplify defaults to True (cleaner, RKNN-friendly graph) but stays overridable: rknn-toolkit1 (rv1126 and
+        # friends) matches subgraph templates, so a slimmed graph can fail to load where the unslimmed one converts.
         f_onnx = Path(self.export_onnx())
         f = f_onnx.with_name(f"{f_onnx.stem}_rknn.onnx")  # distinguish from a plain ONNX export
         f_onnx.replace(f)
